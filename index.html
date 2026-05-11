@@ -1,0 +1,1106 @@
+<html lang="fr"><head>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/html-to-image/1.11.13/html-to-image.min.js" integrity="sha512-iZ2ORl595Wx6miw+GuadDet4WQbdSWS3JLMoNfY8cRGoEFy6oT3G9IbcrBeL6AfkgpA51ETt/faX6yLV+/gFJg==" crossorigin="anonymous" referrerpolicy="no-referrer"></script>
+    <script>
+      (function() {
+        const originalConsole = window.console;
+        window.console = {
+          log: (...args) => {
+            originalConsole.log(...args);
+            window.parent.postMessage({ type: 'console', message: args.join(' ') }, '*');
+          },
+          error: (...args) => {
+            originalConsole.error(...args);
+            window.parent.postMessage({ type: 'console', message: 'Error: ' + args.join(' ') }, '*');
+          },
+          warn: (...args) => {
+            originalConsole.warn(...args);
+            window.parent.postMessage({ type: 'console', message: 'Warning: ' + args.join(' ') }, '*');
+          }
+        };
+
+        let requestId = 0;
+        let callbacksMap = new Map();
+        let streamControllers = new Map();
+        
+        window.claude = {
+          complete: (prompt) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'claudeComplete', id, prompt }, '*');
+            });
+          }
+        };
+
+        window.storage = {
+          get: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageGet', id, key, shared }, '*');
+            });
+          },
+          set: (key, value, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageSet', id, key, value, shared }, '*');
+            });
+          },
+          delete: (key, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageDelete', id, key, shared }, '*');
+            });
+          },
+          list: (prefix, shared = false) => {
+            return new Promise((resolve, reject) => {
+              const id = requestId++;
+              callbacksMap.set(id, { resolve, reject });
+              window.parent.postMessage({ type: 'storageList', id, prefix, shared }, '*');
+            });
+          }
+        };
+
+        let pendingBlobs = new Map();
+        URL.createObjectURL = (blob) => {
+          // Store the blob and create an ID and URL for it
+          const blobId = `blob-${Date.now()}-${Math.random()}`;
+          pendingBlobs.set(blobId, blob);
+          return `blob-request://${blobId}`;
+        };
+
+        URL.revokeObjectURL = (url) => {
+          // Remove the blob from our store
+          const blobId = url.replace("blob-request://", "");
+          pendingBlobs.delete(blobId);
+        };
+
+        const getBlobFromURL = (url) => {
+          const blobId = url.replace("blob-request://", "");
+          return pendingBlobs.get(blobId);
+        };
+
+        // Override global fetch with streaming support
+        window.fetch = (url, init = {}) => {
+          return new Promise((resolve, reject) => {
+            const id = requestId++;
+            const channelId = `fetch-${id}-${Date.now()}`;
+            
+            callbacksMap.set(id, { 
+              resolve: (response) => {
+                // Create a ReadableStream for the response body
+                const stream = new ReadableStream({
+                  start(controller) {
+                    streamControllers.set(channelId, controller);
+                  },
+                  cancel() {
+                    streamControllers.delete(channelId);
+                  }
+                });
+                
+                // Create and return the Response with the stream
+                resolve(new Response(stream, {
+                  status: response.status,
+                  statusText: response.statusText,
+                  headers: response.headers
+                }));
+              },
+              reject,
+              channelId
+            });
+            
+            window.parent.postMessage({
+              type: 'proxyFetch',
+              id,
+              url,
+              init,
+              channelId
+            }, '*');
+          });
+        };
+
+        window.addEventListener('message', async (event) => {
+          if (event.data.type === 'takeScreenshot') {
+            const rootElement = document.getElementById('artifacts-component-root-html');
+            if (!rootElement) {
+              window.parent.postMessage({
+                type: 'screenshotError',
+                error: new Error('Root element not found'),
+              }, '*');
+            }
+            const screenshot = await htmlToImage.toPng(rootElement, {
+              imagePlaceholder:
+                "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAAAXNSR0IArs4c6QAAAA1JREFUGFdjePDgwX8ACOQDoNsk0PMAAAAASUVORK5CYII=",
+            });
+            window.parent.postMessage({
+              type: 'screenshotData',
+              data: screenshot,
+            }, '*');
+          } else if (event.data.type === 'claudeComplete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.completion);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'proxyFetchResponse') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+              callbacksMap.delete(event.data.id);
+            } else {
+              // Initial response with headers, status, etc.
+              callback.resolve({
+                status: event.data.status,
+                statusText: event.data.statusText,
+                headers: event.data.headers
+              });
+              // Don't delete the callback yet if streaming
+              if (!event.data.body) {
+                callbacksMap.delete(event.data.id);
+              }
+            }
+          } else if (event.data.type === 'proxyFetchStream') {
+            // Handle streaming data chunks
+            const controller = streamControllers.get(event.data.channelId);
+            if (controller) {
+              if (event.data.error) {
+                controller.error(new Error(event.data.error));
+                streamControllers.delete(event.data.channelId);
+              } else if (event.data.done) {
+                controller.close();
+                streamControllers.delete(event.data.channelId);
+                // Clean up the callback
+                const callback = Array.from(callbacksMap.entries()).find(
+                  ([_, value]) => value.channelId === event.data.channelId
+                );
+                if (callback) {
+                  callbacksMap.delete(callback[0]);
+                }
+              } else if (event.data.chunk) {
+                controller.enqueue(new Uint8Array(event.data.chunk));
+              }
+            }
+          } else if (event.data.type === 'storageGet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageSet') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageDelete') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          } else if (event.data.type === 'storageList') {
+            const callback = callbacksMap.get(event.data.id);
+            if (event.data.error) {
+              callback.reject(new Error(event.data.error));
+            } else {
+              callback.resolve(event.data.result);
+            }
+            callbacksMap.delete(event.data.id);
+          }
+        });
+
+        window.addEventListener('click', (event) => {
+          const isEl = event.target instanceof HTMLElement;
+          if (!isEl) return;
+    
+          // find ancestor links
+          const linkEl = event.target.closest("a");
+          if (!linkEl || !linkEl.href) return;
+    
+          event.preventDefault();
+          event.stopImmediatePropagation();
+    
+          if (linkEl.href.startsWith("blob-request:")) {
+            const blob = getBlobFromURL(linkEl.href);
+            if (!blob) return;
+            void blob.arrayBuffer().then((data) => {
+              window.parent.postMessage({
+                type: "downloadFile",
+                filename: linkEl.download,
+                data,
+                mimeType: blob.type || "application/octet-stream",
+              });
+            });
+          } else if (linkEl.href.startsWith("data:")) {
+            const [header, base64Data] = linkEl.href.split(",");
+            const mimeMatch = header.match(/data:([^;]+)/);
+            const mimeType = mimeMatch ? mimeMatch[1] : "application/octet-stream";
+            const binaryString = atob(base64Data);
+            const data = Uint8Array.from(binaryString, (c) =>
+              c.charCodeAt(0),
+            ).buffer;
+            window.parent.postMessage({
+              type: "downloadFile",
+              filename: linkEl.download,
+              data,
+              mimeType,
+            });
+          } else {
+            let linkUrl;
+            try {
+              linkUrl = new URL(linkEl.href);
+            } catch (error) {
+              return;
+            }
+    
+            if (linkUrl.hostname === window.location.hostname) return;
+      
+            window.parent.postMessage({
+              type: 'openExternal',
+              href: linkEl.href,
+            }, '*');
+          }
+      });
+
+        const originalOpen = window.open;
+        window.open = function (url) {
+          window.parent.postMessage({
+            type: "openExternal",
+            href: url,
+          }, "*");
+        };
+
+        window.addEventListener('error', (event) => {
+          window.parent.postMessage({ type: 'console', message: 'Uncaught Error: ' + event.message }, '*');
+        });
+      })();
+    </script>
+  
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0">
+<title>Demande de congé – Rio Tinto</title>
+<link href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800&amp;family=Barlow:wght@300;400;500;600&amp;display=swap" rel="stylesheet">
+<style>
+:root{--rouge:#C8102E;--rouge-lt:#FF1A3C;--noir:#0A0A0A;--gris-dk:#1A1A1A;--gris-md:#2C2C2C;--gris-lt:#3D3D3D;--gris-bd:#555;--gris-tx:#AAA;--blanc:#F5F5F5;--or:#D4A017;--vert:#2ECC71;--r:4px}
+*{box-sizing:border-box;margin:0;padding:0}
+body{background:var(--noir);color:var(--blanc);font-family:'Barlow',sans-serif;min-height:100vh;padding-bottom:80px}
+header{background:var(--gris-dk);border-bottom:3px solid var(--rouge);padding:16px 20px;display:flex;align-items:center;gap:14px;position:sticky;top:0;z-index:100}
+.logo-block{width:42px;height:42px;background:var(--rouge);display:flex;align-items:center;justify-content:center;flex-shrink:0;clip-path:polygon(0 0,85% 0,100% 50%,85% 100%,0 100%)}
+.logo-block svg{width:24px;height:24px;fill:none;stroke:white;stroke-width:2}
+.header-text h1{font-family:'Barlow Condensed',sans-serif;font-weight:800;font-size:1.35rem;letter-spacing:.04em;text-transform:uppercase;color:white}
+.header-text p{font-size:.72rem;color:var(--gris-tx);letter-spacing:.08em;text-transform:uppercase;margin-top:2px}
+.progress-wrap{background:var(--gris-md);padding:10px 20px;display:flex;gap:6px;align-items:center}
+.step-dot{width:28px;height:4px;background:var(--gris-lt);border-radius:2px;transition:background .3s}
+.step-dot.active{background:var(--rouge)}.step-dot.done{background:var(--vert)}
+.progress-label{font-size:.7rem;color:var(--gris-tx);margin-left:auto;letter-spacing:.05em;text-transform:uppercase}
+.container{max-width:560px;margin:0 auto;padding:0 16px}
+.card{background:var(--gris-dk);border:1px solid var(--gris-lt);border-left:3px solid var(--rouge);margin-top:16px;padding:20px 18px;display:none;animation:slideIn .25s ease}
+.card.visible{display:block}
+@keyframes slideIn{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:translateY(0)}}
+.stitle{font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;color:var(--rouge);margin-bottom:16px;display:flex;align-items:center;gap:8px}
+.stitle::after{content:'';flex:1;height:1px;background:var(--gris-lt)}
+.field{margin-bottom:16px}
+label{display:block;font-size:.72rem;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:var(--gris-tx);margin-bottom:6px}
+.req{color:var(--rouge);margin-left:2px}
+input[type=text],input[type=number],textarea{width:100%;background:var(--gris-md);border:1px solid var(--gris-lt);border-radius:var(--r);color:var(--blanc);font-family:'Barlow',sans-serif;font-size:1rem;padding:11px 14px;outline:none;transition:border-color .2s;-webkit-appearance:none}
+input[type=datetime-local],input[type=date],input[type=time]{width:100%;background:#4A4A4A;border:1px solid #888;border-radius:var(--r);color:#FFF;font-family:'Barlow',sans-serif;font-size:1rem;padding:11px 14px;outline:none;-webkit-appearance:none;color-scheme:light}
+input:focus,textarea:focus{border-color:var(--rouge)}
+input::placeholder,textarea::placeholder{color:var(--gris-bd)}
+.emp-ok{background:#0f2a0f;border:1px solid var(--vert);border-radius:var(--r);padding:10px 14px;margin-top:8px;font-size:.88rem;color:var(--vert);display:none;align-items:center;gap:8px}
+.emp-ok.on{display:flex}
+.emp-err{background:#2a0f0f;border:1px solid var(--rouge);border-radius:var(--r);padding:10px 14px;margin-top:8px;font-size:.85rem;color:#ff6b6b;display:none}
+.emp-err.on{display:block}
+.grid2{display:grid;grid-template-columns:1fr 1fr;gap:10px}
+.type-btns{display:grid;grid-template-columns:1fr 1fr;gap:10px;margin-top:4px}
+.type-btn{padding:14px;border:2px solid var(--gris-lt);border-radius:var(--r);background:var(--gris-md);color:var(--gris-tx);font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:1rem;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;transition:all .2s}
+.type-btn.active{border-color:var(--rouge);color:var(--blanc);background:var(--gris-lt)}
+.duree-info{background:var(--gris-md);border:1px solid var(--gris-lt);border-radius:var(--r);padding:10px 14px;margin-top:10px;font-size:.85rem;color:var(--gris-tx);display:none;align-items:center;gap:8px}
+.duree-info.on{display:flex}
+.duree-info strong{color:var(--or);font-size:1rem}
+.cpt{background:var(--gris-md);border:2px solid var(--gris-lt);border-radius:var(--r);padding:18px 16px;margin-bottom:16px;text-align:center;transition:border-color .3s}
+.cpt.ok{border-color:var(--vert)}.cpt.over{border-color:#FF4444}
+.cpt-lbl{font-size:.7rem;letter-spacing:.1em;text-transform:uppercase;color:var(--gris-tx);margin-bottom:10px}
+.cpt-nums{display:flex;align-items:center;justify-content:center;gap:14px}
+.cpt-bloc{text-align:center}
+.cpt-val{font-family:'Barlow Condensed',sans-serif;font-weight:800;font-size:2.6rem;line-height:1;transition:color .3s}
+.cpt-sub{font-size:.62rem;color:var(--gris-tx);text-transform:uppercase;letter-spacing:.08em;margin-top:2px}
+.cpt-sep{font-size:2rem;color:var(--gris-bd)}
+.cpt-bar-wrap{background:var(--gris-lt);border-radius:4px;height:8px;margin-top:14px;overflow:hidden}
+.cpt-bar{height:100%;width:0%;border-radius:4px;transition:width .3s,background .3s;background:var(--rouge)}
+.cpt-reste{margin-top:10px;font-size:.88rem;color:var(--gris-tx)}
+.cpt-reste span{font-weight:700;font-size:1rem;transition:color .3s}
+.banques{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.bq{background:var(--gris-md);border:1px solid var(--gris-lt);border-radius:var(--r);padding:10px 10px;display:flex;align-items:center;gap:6px;min-width:0;box-sizing:border-box;overflow:hidden}
+.bq-lbl{font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:.95rem;color:var(--or);flex:0 0 auto;white-space:nowrap}
+.bq input{background:transparent;border:none;border-bottom:1px solid var(--gris-bd);border-radius:0;padding:2px 2px;flex:1 1 0;min-width:0;width:100%;font-size:.95rem;color:var(--blanc);text-align:center;outline:none}
+.bq input:focus{border-bottom-color:var(--rouge)}
+.bq input:disabled{opacity:.4;cursor:not-allowed}
+.bq.disabled{opacity:.55}
+.bq-unit{font-size:.72rem;color:var(--gris-tx);text-transform:uppercase;flex:0 0 auto}
+.bq-w-msg{display:none;margin-top:10px;background:rgba(255,68,68,.12);border:1px solid #FF4444;border-radius:var(--r);padding:10px 12px;font-size:.82rem;color:#FFB0B0;line-height:1.4}
+.bq-w-msg.on{display:block}
+@media (max-width:420px){
+  .banques{gap:6px}
+  .bq{padding:8px 8px;gap:4px}
+  .bq-lbl{font-size:.85rem}
+  .bq input{font-size:.9rem}
+  .bq-unit{font-size:.65rem}
+}
+.btn-row{display:flex;gap:10px;margin-top:20px}
+.btn{flex:1;padding:14px;border:none;border-radius:var(--r);font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:1rem;letter-spacing:.1em;text-transform:uppercase;cursor:pointer;transition:all .2s}
+.btn-sec{background:var(--gris-md);color:var(--gris-tx);border:1px solid var(--gris-lt)}.btn-sec:hover{background:var(--gris-lt);color:var(--blanc)}
+.btn-pri{background:var(--rouge);color:white}.btn-pri:hover{background:var(--rouge-lt)}.btn-pri:active{transform:scale(.98)}
+.res-block{background:var(--gris-md);border-radius:var(--r);padding:14px;margin-bottom:12px}
+.res-row{display:flex;justify-content:space-between;padding:6px 0;border-bottom:1px solid var(--gris-lt);font-size:.88rem}
+.res-row:last-child{border-bottom:none}
+.res-key{color:var(--gris-tx)}.res-val{color:var(--blanc);font-weight:500;text-align:right;max-width:60%}
+.confirm{display:none;text-align:center;padding:40px 20px}.confirm.on{display:block}
+.check-circle{width:72px;height:72px;background:var(--vert);border-radius:50%;display:flex;align-items:center;justify-content:center;margin:0 auto 20px;font-size:2rem;animation:pop .4s cubic-bezier(.175,.885,.32,1.275)}
+@keyframes pop{from{transform:scale(0)}to{transform:scale(1)}}
+.confirm h2{font-family:'Barlow Condensed',sans-serif;font-weight:800;font-size:1.8rem;text-transform:uppercase;margin-bottom:10px}
+.confirm p{color:var(--gris-tx);font-size:.92rem;line-height:1.6}
+.new-btn{margin-top:28px;display:inline-block;padding:13px 28px;background:var(--gris-md);border:1px solid var(--gris-lt);border-radius:var(--r);color:var(--blanc);font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:.95rem;letter-spacing:.08em;text-transform:uppercase;cursor:pointer}
+.alert{background:#2a0f0f;border:1px solid var(--rouge);border-radius:var(--r);padding:12px 16px;font-size:.88rem;color:#ff8080;margin-bottom:12px;display:none}
+.alert.on{display:block}
+textarea{resize:vertical;min-height:80px;font-size:.95rem}
+/* LOGIN ADMIN */
+#admin-login{display:none;position:fixed;bottom:0;left:0;right:0;background:var(--gris-dk);border-top:2px solid var(--rouge);padding:14px 16px;z-index:500;text-align:center}
+#admin-login input{background:var(--gris-md);border:1px solid var(--gris-lt);border-radius:var(--r);color:var(--blanc);font-family:'Barlow',sans-serif;font-size:.9rem;padding:9px 12px;outline:none;width:200px;margin-right:8px}
+#admin-login input:focus{border-color:var(--rouge)}
+.btn-admin-ok{background:var(--rouge);color:white;border:none;border-radius:var(--r);font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:.9rem;letter-spacing:.08em;padding:9px 16px;cursor:pointer}
+.btn-admin-cancel{background:var(--gris-md);color:var(--gris-tx);border:1px solid var(--gris-lt);border-radius:var(--r);font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:.9rem;padding:9px 12px;cursor:pointer;margin-left:4px}
+/* PANNEAU ADMIN */
+#admin-panel{display:none;position:fixed;top:0;left:0;right:0;bottom:0;background:#0a0a0a;z-index:9999;overflow-y:auto;padding:20px}
+.adm-hdr{display:flex;justify-content:space-between;align-items:center;margin-bottom:20px;padding-bottom:14px;border-bottom:2px solid var(--rouge)}
+.adm-hdr h2{font-family:'Barlow Condensed',sans-serif;font-weight:800;font-size:1.4rem;text-transform:uppercase;color:var(--rouge)}
+.adm-sec{background:var(--gris-dk);border:1px solid var(--gris-lt);border-left:3px solid var(--or);padding:16px;margin-bottom:16px;border-radius:var(--r)}
+.adm-title{font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:.78rem;letter-spacing:.12em;text-transform:uppercase;color:var(--or);margin-bottom:12px}
+.adm-inp{width:100%;background:var(--gris-md);border:1px solid var(--gris-lt);border-radius:var(--r);color:var(--blanc);font-family:'Barlow',sans-serif;font-size:.9rem;padding:9px 12px;outline:none;margin-bottom:8px}
+.adm-inp:focus{border-color:var(--or)}
+.adm-grid{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+.adm-btn{width:100%;padding:12px;border:none;border-radius:var(--r);font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:.95rem;letter-spacing:.08em;text-transform:uppercase;cursor:pointer;margin-top:6px}
+.adm-btn-add{background:var(--vert);color:white}
+.adm-btn-exp{background:var(--or);color:#000}
+.adm-btn-close{background:var(--gris-md);color:var(--gris-tx);border:1px solid var(--gris-lt);padding:8px 16px;border-radius:var(--r);font-family:'Barlow Condensed',sans-serif;font-weight:700;font-size:.85rem;cursor:pointer}
+.emp-item{display:flex;justify-content:space-between;align-items:center;padding:8px 12px;background:var(--gris-md);border-radius:var(--r);margin-bottom:6px}
+.emp-info{flex:1}
+.emp-mat{color:var(--or);font-weight:700;font-size:.8rem}
+.emp-nom{color:var(--blanc);font-size:.88rem}
+.emp-email{color:var(--gris-tx);font-size:.75rem}
+.btn-del{background:var(--rouge);color:white;border:none;border-radius:var(--r);padding:4px 10px;font-size:.75rem;cursor:pointer;margin-left:8px}
+.adm-msg{background:#0f2a0f;border:1px solid var(--vert);border-radius:var(--r);padding:10px;color:var(--vert);font-size:.85rem;margin-top:8px;display:none}
+.adm-msg.on{display:block}
+/* BOUTON ADMIN */
+.adm-float{position:fixed;bottom:10px;left:50%;transform:translateX(-50%);z-index:200;background:none;border:none;color:var(--gris-bd);font-size:.65rem;cursor:pointer;font-family:'Barlow',sans-serif;letter-spacing:.05em;padding:8px 16px}
+</style>
+</head>
+<body id="artifacts-component-root-html">
+<header>
+  <div class="logo-block"><svg viewBox="0 0 24 24"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"></polyline></svg></div>
+  <div class="header-text"><h1>Demande de congé</h1><p>Rio Tinto — Portail employé</p></div>
+</header>
+<div class="progress-wrap">
+  <div class="step-dot active" id="d1"></div>
+  <div class="step-dot" id="d2"></div>
+  <div class="step-dot" id="d3"></div>
+  <div class="step-dot" id="d4"></div>
+  <span class="progress-label" id="step-lbl">Étape 1 / 4</span>
+</div>
+<div class="container">
+  <div class="alert" id="alerte"></div>
+
+  <!-- ÉTAPE 1 -->
+  <div class="card visible" id="s1">
+    <div class="stitle">① Identification</div>
+    <div class="field">
+      <label>Matricule <span class="req">*</span></label>
+      <input type="text" id="mat" placeholder="Ex : 12345" inputmode="numeric" maxlength="10" autocomplete="off" autocorrect="off" autocapitalize="off">
+      <div class="emp-ok" id="emp-ok"><span>✓</span><span id="emp-nom">Sebastien Desbiens</span></div>
+      <div class="emp-err" id="emp-err">Matricule non trouvé. Vérifiez votre numéro.</div>
+    </div>
+    <div class="btn-row"><button class="btn btn-pri" onclick="step1()">Continuer →</button></div>
+  </div>
+
+  <!-- ÉTAPE 2 -->
+  <div class="card" id="s2">
+    <div class="stitle">② Type et période du congé</div>
+    <div class="field">
+      <label>Type de demande <span class="req">*</span></label>
+      <div class="type-btns">
+        <button class="type-btn" id="btn-j" onclick="setType('j')">☀️ Journée</button>
+        <button class="type-btn" id="btn-s" onclick="setType('s')">📅 Semaine</button>
+      </div>
+    </div>
+    <div id="sec-j" style="display:none">
+      <div class="grid2">
+        <div class="field"><label>Date début <span class="req">*</span></label><input type="date" id="deb-j" oninput="calcJ()"></div>
+        <div class="field"><label>Heure début <span class="req">*</span></label><input type="time" id="hdeb-j" oninput="calcJ()"></div>
+      </div>
+      <div class="grid2">
+        <div class="field"><label>Date fin <span class="req">*</span></label><input type="date" id="fin-j" oninput="calcJ()"></div>
+        <div class="field"><label>Heure fin <span class="req">*</span></label><input type="time" id="hfin-j" oninput="calcJ()"></div>
+      </div>
+    </div>
+    <div id="sec-s" style="display:none">
+      <div class="grid2">
+        <div class="field"><label>Date début <span class="req">*</span></label><input type="date" id="deb-s"></div>
+        <div class="field"><label>Heure début <span class="req">*</span></label><input type="time" id="hdeb-s"></div>
+      </div>
+      <div class="grid2">
+        <div class="field"><label>Date fin <span class="req">*</span></label><input type="date" id="fin-s"></div>
+        <div class="field"><label>Heure fin <span class="req">*</span></label><input type="time" id="hfin-s"></div>
+      </div>
+      <div class="field">
+        <label>Nombre total d'heures <span class="req">*</span></label>
+        <input type="number" id="hrs-s" min="1" max="999" step="0.5" placeholder="Ex : 84">
+      </div>
+    </div>
+    <div class="duree-info on" id="duree-info" style="display:none"><span>⏱ Durée :</span><strong id="duree-txt">—</strong></div>
+    <div class="btn-row">
+      <button class="btn btn-sec" onclick="goS(1)">← Retour</button>
+      <button class="btn btn-pri" onclick="step2()">Continuer →</button>
+    </div>
+  </div>
+
+  <!-- ÉTAPE 3 -->
+  <div class="card" id="s3">
+    <div class="stitle">③ Répartition des banques</div>
+    <div class="cpt" id="cpt">
+      <div class="cpt-lbl">Heures à répartir dans les banques</div>
+      <div class="cpt-nums">
+        <div class="cpt-bloc"><div class="cpt-val" id="cpt-att" style="color:var(--gris-tx)">0 h</div><div class="cpt-sub">attribué</div></div>
+        <div class="cpt-sep">/</div>
+        <div class="cpt-bloc"><div class="cpt-val" id="cpt-tot" style="color:var(--blanc)">0 h</div><div class="cpt-sub">demandé</div></div>
+      </div>
+      <div class="cpt-bar-wrap"><div class="cpt-bar" id="cpt-bar"></div></div>
+      <div class="cpt-reste">Reste : <span id="cpt-r" style="color:var(--or)">0 h</span></div>
+    </div>
+    <div class="banques">
+      <div class="bq"><span class="bq-lbl">R4</span><input type="number" id="b-R4" min="0" max="999" step="0.5" placeholder="0" oninput="majCpt()"><span class="bq-unit">h</span></div>
+      <div class="bq"><span class="bq-lbl">R5</span><input type="number" id="b-R5" min="0" max="999" step="0.5" placeholder="0" oninput="majCpt()"><span class="bq-unit">h</span></div>
+      <div class="bq"><span class="bq-lbl">W</span><input type="number" id="b-W" min="0" max="999" step="0.5" placeholder="0" oninput="majCpt()"><span class="bq-unit">h</span></div>
+      <div class="bq"><span class="bq-lbl">VS</span><input type="number" id="b-VS" min="0" max="999" step="0.5" placeholder="0" oninput="majCpt()"><span class="bq-unit">h</span></div>
+      <div class="bq"><span class="bq-lbl">VS Retardé</span><input type="number" id="b-VSR" min="0" max="999" step="0.5" placeholder="0" oninput="majCpt()"><span class="bq-unit">h</span></div>
+      <div class="bq"><span class="bq-lbl">VS Vieux</span><input type="number" id="b-VSV" min="0" max="999" step="0.5" placeholder="0" oninput="majCpt()"><span class="bq-unit">h</span></div>
+      <div class="bq"><span class="bq-lbl">Z</span><input type="number" id="b-Z" min="0" max="999" step="0.5" placeholder="0" oninput="majCpt()"><span class="bq-unit">h</span></div>
+    </div>
+    <div class="bq-w-msg" id="bq-w-msg">⚠️ <strong>Banque W indisponible :</strong> cette banque nécessite une demande au moins <strong>7 jours</strong> avant la date de début du congé. Votre demande actuelle ne respecte pas ce délai.</div>
+    <div class="field" style="margin-top:16px"><label>Notes (optionnel)</label><textarea id="notes" placeholder="Précisions..."></textarea></div>
+    <div class="btn-row">
+      <button class="btn btn-sec" onclick="goS(2)">← Retour</button>
+      <button class="btn btn-pri" onclick="step3()">Réviser →</button>
+    </div>
+  </div>
+
+  <!-- ÉTAPE 4 -->
+  <div class="card" id="s4">
+    <div class="stitle">④ Révision &amp; envoi</div>
+    <div class="res-block" id="resume"></div>
+    <div style="background:#1a1200;border:1px solid var(--or);border-radius:4px;padding:12px 14px;font-size:.83rem;color:#d4a017;margin-bottom:4px">⚠️ Vérifiez avant d'envoyer. Premier arrivé, premier servi.</div>
+    <div class="btn-row">
+      <button class="btn btn-sec" onclick="goS(3)">← Modifier</button>
+      <button class="btn btn-pri" onclick="envoyer()">✉ Envoyer</button>
+    </div>
+  </div>
+
+  <!-- CONFIRMATION -->
+  <div class="confirm" id="conf">
+    <div class="check-circle">✓</div>
+    <h2>Demande envoyée !</h2>
+    <p>Votre demande a été transmise.<br>Vous recevrez une réponse par courriel.<br><br>
+    <strong>Délai :</strong><br>Journée → veille avant 13h<br>Semaine → jeudi précédent</p>
+    <button class="new-btn" onclick="reset()">+ Nouvelle demande</button>
+  </div>
+</div>
+
+<!-- BOUTON ADMIN -->
+<button class="adm-float" onclick="showLogin()">🔒 Admin</button>
+
+<!-- LOGIN ADMIN -->
+<div id="admin-login" style="display: none;">
+  <input type="password" id="mdp-input" placeholder="Mot de passe admin" onkeypress="if(event.key==='Enter')checkMdp()">
+  <button class="btn-admin-ok" onclick="checkMdp()">OK</button>
+  <button class="btn-admin-cancel" onclick="hideLogin()">✕</button>
+</div>
+
+<!-- PANNEAU ADMIN -->
+<div id="admin-panel" style="display: none;">
+  <div class="adm-hdr">
+    <h2>⚙️ Administration</h2>
+    <button class="adm-btn-close" onclick="closeAdmin()">✕ Fermer</button>
+  </div>
+  <div class="adm-sec">
+    <div class="adm-title">📧 Courriels de réception</div>
+    <label style="color:var(--gris-tx);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;display:block">Courriel principal (vous)</label>
+    <input type="text" class="adm-inp" id="a-dest" placeholder="votre@riotinto.com">
+    <label style="color:var(--gris-tx);font-size:.72rem;letter-spacing:.08em;text-transform:uppercase;margin-bottom:4px;display:block;margin-top:4px">Courriel remplaçant (CC)</label>
+    <input type="text" class="adm-inp" id="a-copie" placeholder="remplacant@riotinto.com">
+  </div>
+  <div class="adm-sec">
+    <div class="adm-title">👷 Employés</div>
+    <div id="a-liste"><div class="emp-item"><div class="emp-info"><div class="emp-mat">12345</div><div class="emp-nom">Jules Desbiens</div><div class="emp-email">jules.desbiens@gmail.com</div></div><button class="btn-del" onclick="delEmp('12345')">✕</button></div><div class="emp-item"><div class="emp-info"><div class="emp-mat">99999</div><div class="emp-nom">Audrey Gauthier</div><div class="emp-email">audrey2179@hotmail.com</div></div><button class="btn-del" onclick="delEmp('99999')">✕</button></div><div class="emp-item"><div class="emp-info"><div class="emp-mat">460026</div><div class="emp-nom">Sebastien Desbiens</div><div class="emp-email">sebastien.desbiens324@gmail.com</div></div><button class="btn-del" onclick="delEmp('460026')">✕</button></div></div>
+    <div class="adm-title" style="margin-top:14px">➕ Ajouter</div>
+    <div class="adm-grid">
+      <input type="text" class="adm-inp" id="a-mat" placeholder="Matricule">
+      <input type="text" class="adm-inp" id="a-nom" placeholder="Nom">
+    </div>
+    <div class="adm-grid">
+      <input type="text" class="adm-inp" id="a-prenom" placeholder="Prénom">
+      <input type="text" class="adm-inp" id="a-email" placeholder="courriel@gmail.com">
+    </div>
+    <button class="adm-btn adm-btn-add" onclick="addEmp()">+ Ajouter</button>
+    <div class="adm-msg" id="a-msg">✓ Employé ajouté !</div>
+  </div>
+  <div class="adm-sec">
+    <div class="adm-title">💾 Sauvegarder</div>
+    <p style="font-size:.82rem;color:var(--gris-tx);margin-bottom:10px">Téléchargez le fichier mis à jour et uploadez-le sur Netlify.</p>
+    <button class="adm-btn adm-btn-exp" onclick="exporter()">⬇ Télécharger le nouveau fichier</button>
+  </div>
+</div>
+
+<script>
+// ── CONFIG ────────────────────────────────────────────────────────────
+var EMP = {
+  "12345": {nom:"Desbiens",prenom:"Jules",courriel:"jules.desbiens@gmail.com"},
+  "99999": {nom:"Gauthier",prenom:"Audrey",courriel:"audrey2179@hotmail.com"},
+  "460026": {nom:"Desbiens",prenom:"Sebastien",courriel:"sebastien.desbiens324@gmail.com"}
+};
+var DEST  = 'sebastien.desbiens@riotinto.com';
+var COPIE = '';
+var MDP   = 'CongesPort';
+
+// ── PERSISTANCE (window.storage + localStorage fallback) ─────────────
+var _storageReady = false;
+
+function _lsGet(key) { try { return localStorage.getItem(key); } catch(e) { return null; } }
+function _lsSet(key, val) { try { localStorage.setItem(key, val); } catch(e) {} }
+
+function sauvegarder() {
+  var empJson = JSON.stringify(EMP);
+  _lsSet('rt_emp', empJson);
+  _lsSet('rt_dest', DEST);
+  _lsSet('rt_copie', COPIE);
+  if (typeof window.storage !== 'undefined') {
+    window.storage.set('rt_emp', empJson);
+    window.storage.set('rt_dest', DEST);
+    window.storage.set('rt_copie', COPIE);
+  }
+}
+
+function _appliquerDonnees(empJson, dest, copie) {
+  if (empJson) { try { EMP = JSON.parse(empJson); } catch(e) {} }
+  if (dest) DEST = dest;
+  if (copie !== null && copie !== undefined) COPIE = copie;
+}
+
+// Chargement synchrone localStorage (standalone)
+_appliquerDonnees(_lsGet('rt_emp'), _lsGet('rt_dest'), _lsGet('rt_copie'));
+
+// Chargement asynchrone window.storage (iframe Claude)
+document.addEventListener('DOMContentLoaded', function() {
+  if (typeof window.storage === 'undefined') return;
+  Promise.all([
+    window.storage.get('rt_emp'),
+    window.storage.get('rt_dest'),
+    window.storage.get('rt_copie')
+  ]).then(function(vals) {
+    _appliquerDonnees(vals[0], vals[1], vals[2]);
+    _storageReady = true;
+  }).catch(function() { _storageReady = true; });
+});
+var BQ    = [["b-R4","R4"],["b-R5","R5"],["b-W","W"],["b-VS","VS"],
+             ["b-VSR","VS Retarde"],["b-VSV","VS de vieux"],
+             ["b-Z","Z"]];
+
+// ── STATE ─────────────────────────────────────────────────────────────
+var step = 1;
+var type = '';
+var duree = 0;
+
+// ── NAVIGATION ────────────────────────────────────────────────────────
+function goS(n) {
+  document.getElementById('s'+step).classList.remove('visible');
+  step = n;
+  document.getElementById('s'+n).classList.add('visible');
+  updProg();
+  window.scrollTo({top:0,behavior:'smooth'});
+  if (n===3) initCpt();
+  if (n===2) restoreType();
+}
+function updProg() {
+  for (var i=1;i<=4;i++) {
+    var d = document.getElementById('d'+i);
+    d.className = 'step-dot';
+    if (i<step) d.classList.add('done');
+    if (i===step) d.classList.add('active');
+  }
+  document.getElementById('step-lbl').textContent = 'Étape '+step+' / 4';
+}
+function restoreType() {
+  document.getElementById('sec-j').style.display = type==='j' ? 'block' : 'none';
+  document.getElementById('sec-s').style.display = type==='s' ? 'block' : 'none';
+  document.getElementById('btn-j').className = 'type-btn' + (type==='j'?' active':'');
+  document.getElementById('btn-s').className = 'type-btn' + (type==='s'?' active':'');
+}
+
+// ── ÉTAPE 1 ───────────────────────────────────────────────────────────
+document.getElementById('mat').addEventListener('input', checkMat);
+document.getElementById('mat').addEventListener('change', checkMat);
+
+function checkMat() {
+  var m = document.getElementById('mat').value.trim();
+  var e = EMP[m];
+  var ok = document.getElementById('emp-ok');
+  var err = document.getElementById('emp-err');
+  if (m.length >= 4) {
+    if (e) {
+      document.getElementById('emp-nom').textContent = e.prenom + ' ' + e.nom;
+      ok.className = 'emp-ok on';
+      err.className = 'emp-err';
+    } else {
+      ok.className = 'emp-ok';
+      err.className = 'emp-err on';
+    }
+  } else {
+    ok.className = 'emp-ok';
+    err.className = 'emp-err';
+  }
+}
+
+function step1() {
+  var m = document.getElementById('mat').value.trim();
+  if (!m) { showAlert('Veuillez entrer votre matricule.'); return; }
+  if (!EMP[m]) { showAlert('Matricule non reconnu. Contactez votre responsable.'); return; }
+  var e = EMP[m];
+  document.getElementById('emp-nom').textContent = e.prenom + ' ' + e.nom;
+  document.getElementById('emp-ok').className = 'emp-ok on';
+  hideAlert();
+  goS(2);
+}
+
+// ── ÉTAPE 2 ───────────────────────────────────────────────────────────
+function setType(t) {
+  type = t;
+  document.getElementById('btn-j').className = 'type-btn' + (t==='j'?' active':'');
+  document.getElementById('btn-s').className = 'type-btn' + (t==='s'?' active':'');
+  document.getElementById('sec-j').style.display = t==='j' ? 'block' : 'none';
+  document.getElementById('sec-s').style.display = t==='s' ? 'block' : 'none';
+  document.getElementById('duree-info').style.display = 'none';
+  duree = 0;
+}
+
+function calcJ() {
+  var d = document.getElementById('deb-j').value;
+  var hd = document.getElementById('hdeb-j').value;
+  var f = document.getElementById('fin-j').value;
+  var hf = document.getElementById('hfin-j').value;
+  if (d && hd && f && hf) {
+    var debDT = new Date(d+'T'+hd);
+    var finDT = new Date(f+'T'+hf);
+    var diff = (finDT - debDT) / 3600000;
+    if (diff > 0) {
+      duree = Math.round(diff*10)/10;
+      document.getElementById('duree-txt').textContent = duree + ' h';
+      document.getElementById('duree-info').style.display = 'flex';
+    } else {
+      duree = 0;
+      document.getElementById('duree-info').style.display = 'none';
+    }
+  } else {
+    duree = 0;
+    document.getElementById('duree-info').style.display = 'none';
+  }
+}
+
+function step2() {
+  if (!type) { showAlert('Veuillez choisir Journée ou Semaine.'); return; }
+  if (type === 'j') {
+    var d = document.getElementById('deb-j').value;
+    var hd = document.getElementById('hdeb-j').value;
+    var f = document.getElementById('fin-j').value;
+    var hf = document.getElementById('hfin-j').value;
+    if (!d) { showAlert('Veuillez sélectionner une date de début.'); return; }
+    if (!hd) { showAlert('Veuillez sélectionner une heure de début.'); return; }
+    if (!f) { showAlert('Veuillez sélectionner une date de fin.'); return; }
+    if (!hf) { showAlert('Veuillez sélectionner une heure de fin.'); return; }
+    if (new Date(f+'T'+hf) <= new Date(d+'T'+hd)) { showAlert('La date de fin doit être après le début.'); return; }
+  } else {
+    var d2 = document.getElementById('deb-s').value;
+    var hd = document.getElementById('hdeb-s').value;
+    var f2 = document.getElementById('fin-s').value;
+    var hf = document.getElementById('hfin-s').value;
+    var hs = parseFloat(document.getElementById('hrs-s').value);
+    if (!d2) { showAlert('Veuillez sélectionner une date de début.'); return; }
+    if (!hd) { showAlert('Veuillez sélectionner une heure de début.'); return; }
+    if (!f2) { showAlert('Veuillez sélectionner une date de fin.'); return; }
+    if (!hf) { showAlert('Veuillez sélectionner une heure de fin.'); return; }
+    if (!hs || hs <= 0) { showAlert("Veuillez entrer le nombre total d'heures."); return; }
+    duree = hs;
+    document.getElementById('duree-txt').textContent = hs + ' h (semaine)';
+    document.getElementById('duree-info').style.display = 'flex';
+  }
+  hideAlert();
+  goS(3);
+}
+
+// ── ÉTAPE 3 ───────────────────────────────────────────────────────────
+// Retourne true si la banque W est autorisée (date début >= aujourd'hui + 7 jours)
+function wAutorisee() {
+  var dateStr = '';
+  if (type === 'j') {
+    dateStr = document.getElementById('deb-j').value;
+  } else if (type === 's') {
+    dateStr = document.getElementById('deb-s').value;
+  }
+  if (!dateStr) return false;
+  var parts = dateStr.split('-');
+  if (parts.length !== 3) return false;
+  var debut = new Date(parseInt(parts[0]), parseInt(parts[1])-1, parseInt(parts[2]));
+  var now = new Date();
+  var today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
+  var diffJours = Math.round((debut - today) / (1000*60*60*24));
+  return diffJours >= 7;
+}
+
+function majEtatW() {
+  var inp = document.getElementById('b-W');
+  var cell = inp.parentElement;
+  var msg = document.getElementById('bq-w-msg');
+  if (wAutorisee()) {
+    inp.disabled = false;
+    cell.classList.remove('disabled');
+    msg.classList.remove('on');
+  } else {
+    // Si l'utilisateur avait saisi une valeur, on la remet à 0 et on affiche le message
+    if (parseFloat(inp.value) > 0) {
+      inp.value = '';
+      msg.classList.add('on');
+    }
+  }
+}
+
+function initCpt() {
+  var isSem = type === 's';
+  document.getElementById('cpt-tot').textContent = isSem ? duree + ' h' : duree + ' h';
+  document.getElementById('cpt-att').textContent = '0 h';
+  document.getElementById('cpt-att').style.color = 'var(--gris-tx)';
+  document.getElementById('cpt-bar').style.width = '0%';
+  document.getElementById('cpt-bar').style.background = 'var(--rouge)';
+  document.getElementById('cpt-r').textContent = duree + ' h';
+  document.getElementById('cpt-r').style.color = 'var(--or)';
+  document.getElementById('cpt').className = 'cpt';
+  BQ.forEach(function(b){ document.getElementById(b[0]).value = ''; });
+  // Réinitialise l'état de la banque W selon la date de début
+  var wInp = document.getElementById('b-W');
+  var wCell = wInp.parentElement;
+  var wMsg = document.getElementById('bq-w-msg');
+  wMsg.classList.remove('on');
+  if (wAutorisee()) {
+    wInp.disabled = false;
+    wCell.classList.remove('disabled');
+  } else {
+    wInp.disabled = false; // on laisse éditable pour afficher le msg à la saisie
+    wCell.classList.remove('disabled');
+  }
+}
+
+function majCpt() {
+  // Vérification banque W
+  var wInp = document.getElementById('b-W');
+  var wMsg = document.getElementById('bq-w-msg');
+  if (parseFloat(wInp.value) > 0) {
+    if (!wAutorisee()) {
+      wInp.value = '';
+      wMsg.classList.add('on');
+    } else {
+      wMsg.classList.remove('on');
+    }
+  } else {
+    // Si le champ est vide, on masque le message
+    wMsg.classList.remove('on');
+  }
+  var total = 0;
+  BQ.forEach(function(b){ total += parseFloat(document.getElementById(b[0]).value)||0; });
+  total = Math.round(total*10)/10;
+  var isSem = type === 's';
+  var max = isSem ? duree : duree;
+  var reste = Math.round((max-total)*10)/10;
+  var pct = max > 0 ? Math.min(total/max*100,100) : 0;
+  document.getElementById('cpt-att').textContent = total + ' h';
+  document.getElementById('cpt-tot').textContent = max + ' h';
+  document.getElementById('cpt-bar').style.width = pct + '%';
+  var rEl = document.getElementById('cpt-r');
+  var aEl = document.getElementById('cpt-att');
+  var bEl = document.getElementById('cpt-bar');
+  var cEl = document.getElementById('cpt');
+  if (total > max) {
+    rEl.textContent = '⚠ '+Math.abs(reste)+' h en trop !'; rEl.style.color='#FF4444';
+    aEl.style.color='#FF4444'; bEl.style.background='#FF4444'; cEl.className='cpt over';
+  } else if (total === max) {
+    rEl.textContent = '0 h ✓'; rEl.style.color='var(--vert)';
+    aEl.style.color='var(--vert)'; bEl.style.background='var(--vert)'; cEl.className='cpt ok';
+  } else {
+    rEl.textContent = reste+' h'; rEl.style.color='var(--or)';
+    aEl.style.color='var(--or)'; bEl.style.background='var(--rouge)'; cEl.className='cpt';
+  }
+}
+
+function step3() {
+  var total = 0;
+  BQ.forEach(function(b){ total += parseFloat(document.getElementById(b[0]).value)||0; });
+  total = Math.round(total*10)/10;
+  if (type==='j' && total > duree) {
+    showAlert('Vous avez attribué '+total+'h mais la durée est de '+duree+'h.'); return;
+  }
+  hideAlert(); buildResume(); goS(4);
+}
+
+// ── RÉSUMÉ ────────────────────────────────────────────────────────────
+function buildResume() {
+  var m = document.getElementById('mat').value.trim();
+  var e = EMP[m];
+  var note = document.getElementById('notes').value.trim();
+  function fmtDT(v){ var d=new Date(v); return d.toLocaleDateString('fr-CA')+' à '+d.toLocaleTimeString('fr-CA',{hour:'2-digit',minute:'2-digit'}); }
+  function fmtD(v){ return new Date(v).toLocaleDateString('fr-CA'); }
+  var debAff, finAff, dureeAff;
+  if (type==='j') {
+    debAff = fmtD(document.getElementById('deb-j').value)+' à '+document.getElementById('hdeb-j').value;
+    finAff = fmtD(document.getElementById('fin-j').value)+' à '+document.getElementById('hfin-j').value;
+    dureeAff = duree + ' h';
+  } else {
+    debAff = fmtD(document.getElementById('deb-s').value)+' à '+document.getElementById('hdeb-s').value;
+    finAff = fmtD(document.getElementById('fin-s').value)+' à '+document.getElementById('hfin-s').value;
+    dureeAff = duree + ' h (semaine)';
+  }
+  var bHtml = ''; var total = 0;
+  BQ.forEach(function(b){
+    var v = parseFloat(document.getElementById(b[0]).value)||0;
+    if (v>0){ bHtml+='<div class="res-row"><span class="res-key">Banque '+b[1]+'</span><span class="res-val">'+v+' h</span></div>'; total+=v; }
+  });
+  document.getElementById('resume').innerHTML =
+    '<div class="res-row"><span class="res-key">Employé</span><span class="res-val">'+e.prenom+' '+e.nom+' ('+m+')</span></div>'+
+    '<div class="res-row"><span class="res-key">Type</span><span class="res-val">'+(type==='j'?'Journée':'Semaine')+'</span></div>'+
+    '<div class="res-row"><span class="res-key">Début</span><span class="res-val">'+debAff+'</span></div>'+
+    '<div class="res-row"><span class="res-key">Fin</span><span class="res-val">'+finAff+'</span></div>'+
+    '<div class="res-row"><span class="res-key">Durée</span><span class="res-val" style="color:var(--or);font-weight:700">'+dureeAff+'</span></div>'+
+    (bHtml||'<div class="res-row"><span class="res-key">Banques</span><span class="res-val" style="color:var(--gris-tx)">Aucune</span></div>')+
+    '<div class="res-row"><span class="res-key">Total banques</span><span class="res-val">'+(total>0?total+' h':'—')+'</span></div>'+
+    (note?'<div class="res-row"><span class="res-key">Notes</span><span class="res-val">'+note+'</span></div>':'');
+}
+
+// ── ENVOI ─────────────────────────────────────────────────────────────
+function envoyer() {
+  var m = document.getElementById('mat').value.trim();
+  var e = EMP[m];
+  var note = document.getElementById('notes').value.trim();
+  function fmtD(v){ return new Date(v).toLocaleDateString('fr-CA'); }
+  function fmtH(v){ return new Date(v).toLocaleTimeString('fr-CA',{hour:'2-digit',minute:'2-digit'}); }
+  var debStr, finStr, dureeStr;
+  if (type==='j') {
+    debStr = document.getElementById('deb-j').value+' a '+document.getElementById('hdeb-j').value;
+    finStr = document.getElementById('fin-j').value+' a '+document.getElementById('hfin-j').value;
+    dureeStr = duree+' h';
+  } else {
+    debStr = document.getElementById('deb-s').value+' a '+document.getElementById('hdeb-s').value;
+    finStr = document.getElementById('fin-s').value+' a '+document.getElementById('hfin-s').value;
+    dureeStr = duree+' h (semaine)';
+  }
+  var bTxt = ''; var total = 0;
+  BQ.forEach(function(b){ var v=parseFloat(document.getElementById(b[0]).value)||0; if(v>0){bTxt+=b[1]+': '+v+'h | ';total+=v;} });
+  bTxt = bTxt.replace(/ \| $/,'')||'Aucune';
+  var debDate = type==='j' ? document.getElementById('deb-j').value : document.getElementById('deb-s').value;
+  var sujet = 'RIOTINTO-CONGE - '+m+' - '+e.nom+' '+e.prenom+' - '+fmtD(debDate);
+  var corps = 'DEMANDE DE CONGE - RIO TINTO\n=============================\n'+
+    'MATRICULE : '+m+'\nNOM : '+e.prenom+' '+e.nom+'\nCOURRIEL : '+e.courriel+'\n\n'+
+    'DEBUT : '+debStr+'\nFIN : '+finStr+'\nDUREE : '+dureeStr+'\n\n'+
+    'BANQUES : '+bTxt+'\nTOTAL : '+(total>0?total+'h':'Non specifie')+'\n\n'+
+    'NOTES : '+(note||'Aucune')+'\n=============================\nEnvoye depuis le portail employe Rio Tinto';
+  var cc = COPIE ? '&cc='+encodeURIComponent(COPIE) : '';
+  window.location.href = 'mailto:'+DEST+'?subject='+encodeURIComponent(sujet)+cc+'&body='+encodeURIComponent(corps);
+  setTimeout(function(){
+    document.getElementById('s4').classList.remove('visible');
+    document.getElementById('conf').className = 'confirm on';
+    updProg();
+  }, 800);
+}
+
+// ── RESET ─────────────────────────────────────────────────────────────
+function reset() {
+  document.getElementById('conf').className = 'confirm';
+  document.getElementById('mat').value = '';
+  document.getElementById('emp-ok').className = 'emp-ok';
+  document.getElementById('emp-err').className = 'emp-err';
+  document.getElementById('notes').value = '';
+  document.getElementById('duree-info').style.display = 'none';
+  ['deb-j','hdeb-j','fin-j','hfin-j','deb-s','hdeb-s','fin-s','hfin-s','hrs-s'].forEach(function(id){ document.getElementById(id).value=''; });
+  BQ.forEach(function(b){ document.getElementById(b[0]).value=''; });
+  type=''; duree=0; step=1;
+  document.getElementById('sec-j').style.display='none';
+  document.getElementById('sec-s').style.display='none';
+  document.getElementById('btn-j').className='type-btn';
+  document.getElementById('btn-s').className='type-btn';
+  document.getElementById('s1').classList.add('visible');
+  updProg();
+  window.scrollTo({top:0,behavior:'smooth'});
+}
+
+function showAlert(msg){ var a=document.getElementById('alerte'); a.textContent='⚠ '+msg; a.className='alert on'; window.scrollTo({top:0,behavior:'smooth'}); }
+function hideAlert(){ document.getElementById('alerte').className='alert'; }
+
+// ── ADMIN ─────────────────────────────────────────────────────────────
+function showLogin(){
+  document.getElementById('admin-login').style.display='block';
+  document.getElementById('mdp-input').value='';
+  document.getElementById('mdp-input').focus();
+}
+function hideLogin(){
+  document.getElementById('admin-login').style.display='none';
+  document.getElementById('mdp-input').value='';
+}
+function checkMdp(){
+  var mdp = document.getElementById('mdp-input').value;
+  if (mdp === MDP) {
+    hideLogin();
+    document.getElementById('a-dest').value = DEST;
+    document.getElementById('a-copie').value = COPIE;
+    refreshListe();
+    document.getElementById('admin-panel').style.display = 'block';
+  } else {
+    document.getElementById('mdp-input').value = '';
+    document.getElementById('mdp-input').placeholder = '❌ Mot de passe incorrect';
+    setTimeout(function(){ document.getElementById('mdp-input').placeholder='Mot de passe admin'; }, 2000);
+  }
+}
+function closeAdmin(){
+  DEST = document.getElementById('a-dest').value.trim();
+  COPIE = document.getElementById('a-copie').value.trim();
+  sauvegarder();
+  document.getElementById('admin-panel').style.display='none';
+}
+function refreshListe(){
+  var liste = document.getElementById('a-liste');
+  liste.innerHTML = '';
+  var mats = Object.keys(EMP);
+  if (!mats.length){ liste.innerHTML='<p style="color:var(--gris-tx);font-size:.85rem">Aucun employé.</p>'; return; }
+  mats.forEach(function(m){
+    var e = EMP[m];
+    var div = document.createElement('div');
+    div.className = 'emp-item';
+    div.innerHTML = '<div class="emp-info"><div class="emp-mat">'+m+'</div><div class="emp-nom">'+e.prenom+' '+e.nom+'</div><div class="emp-email">'+e.courriel+'</div></div>'+
+      '<button class="btn-del" onclick="delEmp(\''+m+'\')">✕</button>';
+    liste.appendChild(div);
+  });
+}
+function addEmp(){
+  var m=document.getElementById('a-mat').value.trim();
+  var n=document.getElementById('a-nom').value.trim();
+  var p=document.getElementById('a-prenom').value.trim();
+  var c=document.getElementById('a-email').value.trim();
+  if(!m||!n||!p||!c){ alert('Veuillez remplir tous les champs.'); return; }
+  EMP[m]={nom:n,prenom:p,courriel:c};
+  sauvegarder();
+  document.getElementById('a-mat').value='';
+  document.getElementById('a-nom').value='';
+  document.getElementById('a-prenom').value='';
+  document.getElementById('a-email').value='';
+  refreshListe();
+  var msg=document.getElementById('a-msg');
+  msg.className='adm-msg on';
+  setTimeout(function(){ msg.className='adm-msg'; },2000);
+}
+function delEmp(m){
+  if(confirm('Supprimer '+EMP[m].prenom+' '+EMP[m].nom+' ?')){ delete EMP[m]; sauvegarder(); refreshListe(); }
+}
+function exporter(){
+  try {
+    var dest=document.getElementById('a-dest').value.trim();
+    var copie=document.getElementById('a-copie').value.trim();
+    // Synchronise les variables JS avec les champs
+    DEST = dest;
+    COPIE = copie;
+    var mats=Object.keys(EMP);
+    var lines=mats.map(function(m,i){
+      var e=EMP[m];
+      return '  "'+m+'": {nom:"'+e.nom+'",prenom:"'+e.prenom+'",courriel:"'+e.courriel+'"}'+(i<mats.length-1?',':'');
+    }).join('\n');
+    var empBlock='var EMP = {\n'+lines+'\n};';
+    var destBlock="var DEST  = '"+dest+"';";
+    var copieBlock="var COPIE = '"+copie+"';";
+    var html=document.documentElement.outerHTML;
+
+    var okEmp = /var EMP = \{[\s\S]*?\};/.test(html);
+    var okDest = /var DEST\s*=\s*'[^']*';/.test(html);
+    var okCopie = /var COPIE\s*=\s*'[^']*';/.test(html);
+    if(!okEmp || !okDest || !okCopie){
+      alert('⚠️ Erreur : impossible de trouver les variables dans le HTML.\n'+
+            'EMP='+okEmp+' DEST='+okDest+' COPIE='+okCopie);
+      return;
+    }
+
+    html=html.replace(/var EMP = \{[\s\S]*?\};/,empBlock);
+    html=html.replace(/var DEST\s*=\s*'[^']*';/,destBlock);
+    html=html.replace(/var COPIE\s*=\s*'[^']*';/,copieBlock);
+
+    // Force les panneaux admin et login à display:none dans le fichier exporté
+    html=html.replace(/(<div id="admin-panel"[^>]*?style=")[^"]*(")/, '$1display: none;$2');
+    html=html.replace(/(<div id="admin-login"[^>]*?style=")[^"]*(")/, '$1display: none;$2');
+    // Réaffiche la carte étape 1 et masque les autres étapes/confirmation
+    html=html.replace(/(<div class="card)( visible)?(" id="s1")/, '$1 visible$3');
+    html=html.replace(/(<div class="card) visible(" id="s[234]")/g, '$1$2');
+    html=html.replace(/(<div class="confirm)( on)?(" id="conf")/, '$1$3');
+
+    // Ajoute une doctype si manquante
+    if(!/^<!DOCTYPE/i.test(html)) html='<!DOCTYPE html>\n'+html;
+
+    function feedbackBtn() {
+      var btns=document.querySelectorAll('.adm-btn-exp');
+      if(!btns.length) return;
+      var btn=btns[0]; var txt=btn.textContent;
+      btn.textContent='✅ Fichier téléchargé !'; btn.disabled=true;
+      setTimeout(function(){ btn.textContent=txt; btn.disabled=false; },2500);
+    }
+
+    var blob=new Blob([html],{type:'text/html;charset=utf-8'});
+
+    if(window.parent===window){
+      // Mode autonome (Chrome local) : FileReader + ancre détachée
+      var reader=new FileReader();
+      reader.onload=function(){
+        var a=document.createElement('a');
+        a.href=reader.result;
+        a.download='index.html';
+        a.click(); // ancre détachée : l'événement ne remonte pas au handler Claude
+        feedbackBtn();
+      };
+      reader.readAsDataURL(blob);
+    } else {
+      // Mode prévisualisation Claude : mécanisme blob-request existant
+      var url=URL.createObjectURL(blob);
+      var a=document.createElement('a');
+      a.href=url;
+      a.download='index.html';
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(function(){ URL.revokeObjectURL(url); },1000);
+      feedbackBtn();
+    }
+  } catch(err){
+    alert('❌ Erreur lors de l\'export :\n'+err.message);
+    console.error(err);
+  }
+}
+</script>
+
+
+</body></html>
